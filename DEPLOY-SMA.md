@@ -10,22 +10,22 @@
 
 ## Deployment
 
-CLI: `deployment/cacti/tester-env` (located in tester-env repo, not in the fork)
+CLI lives at the fork root: `./tester-env`.
 
 Commands:
 ```
-deployment/cacti/tester-env deploy   # Build and start containers, run installer
-deployment/cacti/tester-env seed     # Populate deterministic Northwind seed data
-deployment/cacti/tester-env verify   # Health-check web/login/DB + seed counts
-deployment/cacti/tester-env reset    # Stop containers, remove containers + volumes
-deployment/cacti/tester-env stop     # Stop containers
-deployment/cacti/tester-env logs     # Tail web container logs
-deployment/cacti/tester-env status   # Show container status
+./tester-env deploy   # Build and start containers, run installer
+./tester-env seed     # Populate deterministic Northwind seed data
+./tester-env verify   # Health-check web/login/DB + seed counts
+./tester-env reset    # Stop containers, remove containers + volumes
+./tester-env stop     # Stop containers
+./tester-env logs     # Tail web container logs
+./tester-env status   # Show container status
 ```
 
 Full reset-deploy-seed-verify cycle:
 ```
-./deployment/cacti/tester-env reset && ./deployment/cacti/tester-env deploy && ./deployment/cacti/tester-env seed && ./deployment/cacti/tester-env verify
+./tester-env reset && ./tester-env deploy && ./tester-env seed && ./tester-env verify
 ```
 
 ## Build Method
@@ -95,7 +95,7 @@ Full reset-deploy-seed-verify cycle:
 
 ## Verification
 
-`deployment/cacti/tester-env verify` checks:
+`./tester-env verify` checks:
 - Web server responds at /cacti/
 - Login page contains "Cacti" text
 - Admin user exists in database
