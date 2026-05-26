@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cacti - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>] [--source-dir <path>]
+# Commands: deploy, seed, verify, reset, stop, logs, status
+
+RUN_ID="default"
+PORT="8089"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Build context is the submodule itself; the tester-env CLI is committed
+# into the fork alongside the source it builds.
+SOURCE_DIR="${SOURCE_DIR:-${SCRIPT_DIR}}"
+
+# Cacti-specific settings
+DB_ROOT_PASSWORD="root"
+DB_NAME="cacti"
+DB_USER="cacti"
+DB_PASSWORD="cacti"
+DB_PORT="3306"
+PHP_MEMORY_LIMIT="512M"
+TIMEZONE="UTC"
+
+ADMIN_USER="admin"
+ADMIN_PASS="admin123"
+
+refresh_names() {
+    COMPOSE_PROJECT="tester-env-cacti"
+    if [[ "${RUN_ID}" != "default" ]]; then
+        COMPOSE_PROJECT="${COMPOSE_PROJECT}-${RUN_ID}"
+        # Upstream docker-compose.yml hardcodes container_name: cacti_web / cacti_db.
+        # Parallel runs with --run-id need the compose file edited to use unique names,
+        # or a separate source tree. For single-run deploys, use the fixed names.
+        WEB_CONTAINER="cacti_web-${RUN_ID}"
+        DB_CONTAINER="cacti_db-${RUN_ID}"
+    else
+        WEB_CONTAINER="cacti_web"
+        DB_CONTAINER="cacti_db"
+    fi
+}
+
+compose_env() {
+    echo "WEB_PORT=${PORT}"
+    echo "DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}"
+    echo "DB_NAME=${DB_NAME}"
+    echo "DB_USER=${DB_USER}"
+    echo "DB_PASSWORD=${DB_PASSWORD}"
+    echo "DB_PORT=${DB_PORT}"
+    echo "PHP_MEMORY_LIMIT=${PHP_MEMORY_LIMIT}"
+    echo "TIMEZONE=${TIMEZONE}"
+}
+
+clone_source() {
+    if [[ ! -d "${SOURCE_DIR}/.git" ]]; then
+        echo "ERROR: SOURCE_DIR=${SOURCE_DIR} is not a git checkout. The CLI" >&2
+        echo "expects to run from inside the Cacti fork submodule." >&2
+        exit 1
+    fi
+    echo "==> Source at: ${SOURCE_DIR}"
+    echo "==> Commit: $(git -C "${SOURCE_DIR}" rev-parse --short HEAD)"
+}
+
+post_deploy_fixups() {
+    echo "==> Applying runtime fixups..."
+
+    # Create php.ini to suppress PHP 8.4 deprecation warnings that break the CLI installer
+    # (Deprecated: Constant E_STRICT and nullable parameter warnings pollute stdout,
+    #  causing json_decode in utility_php_extensions to fail)
+    docker exec "${WEB_CONTAINER}" bash -c 'cat > /usr/local/etc/php/php.ini <<EOF
+memory_limit = 512M
+date.timezone = UTC
+max_execution_time = 60
+error_reporting = E_ALL & ~E_DEPRECATED & ~E_STRICT
+display_errors = Off
+EOF
+'
+
+    # Install fping (required by Cacti for device availability checks)
+    docker exec "${WEB_CONTAINER}" apt-get update -qq 2>/dev/null
+    docker exec "${WEB_CONTAINER}" apt-get install -y -qq fping 2>/dev/null || true
+
+    # Create cache subdirectories (not created by Dockerfile, needed for install)
+    docker exec "${WEB_CONTAINER}" bash -c '
+        mkdir -p /var/www/html/cacti/cache/{boost,mibcache,realtime,spikekill}
+        chown -R www-data:www-data /var/www/html/cacti/cache/
+    '
+}
+
+run_installer() {
+    echo "==> Running Cacti CLI installer..."
+    docker exec "${WEB_CONTAINER}" php /var/www/html/cacti/cli/install_cacti.php \
+        --install --accept-eula 2>&1 | grep -v 'Deprecated' || {
+        echo "ERROR: Cacti CLI installer failed."
+        return 1
+    }
+
+    echo "==> Setting deterministic admin password (${ADMIN_USER} / ${ADMIN_PASS})..."
+    # Set admin password and disable forced password change
+    local passhash
+    passhash=$(echo -n "${ADMIN_PASS}" | md5sum | awk '{print $1}')
+    docker exec "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -e \
+        "UPDATE user_auth SET password = '${passhash}', must_change_password = '', password_change = 'on' WHERE username = '${ADMIN_USER}';" 2>/dev/null
+
+    echo "==> Fixing file ownership (installer runs as root, web runs as www-data)..."
+    docker exec "${WEB_CONTAINER}" chown -R www-data:www-data \
+        /var/www/html/cacti/log/ \
+        /var/www/html/cacti/cache/ \
+        /var/www/html/cacti/rra/
+}
+
+cmd_deploy() {
+    echo "==> Deploying Cacti (run-id: ${RUN_ID}, port: ${PORT})"
+    echo "    Project: ${COMPOSE_PROJECT}"
+    echo "    Source:  ${SOURCE_DIR}"
+
+    clone_source
+
+    # Copy .env.example to .env if needed
+    if [[ ! -f "${SOURCE_DIR}/.env" ]]; then
+        cp "${SOURCE_DIR}/.env.example" "${SOURCE_DIR}/.env"
+    fi
+
+    echo "==> Building and starting containers..."
+    env $(compose_env) \
+        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
+        up -d --build 2>&1 | tail -5
+
+    echo "==> Waiting for database to be healthy..."
+    local max_attempts=60
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        local db_status
+        db_status=$(docker inspect "${DB_CONTAINER}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
+        if [[ "$db_status" == "healthy" ]]; then
+            echo "==> Database is healthy."
+            break
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo "==> Waiting for web container to be healthy..."
+    attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        local web_status
+        web_status=$(docker inspect "${WEB_CONTAINER}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
+        if [[ "$web_status" == "healthy" ]]; then
+            echo "==> Web container is healthy."
+            break
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    post_deploy_fixups
+    run_installer
+
+    echo "==> Deployment complete."
+    echo "    URL:           http://localhost:${PORT}/cacti/"
+    echo "    Browser MCP:   http://host.docker.internal:${PORT}/cacti/"
+    echo "    User:          ${ADMIN_USER}"
+    echo "    Password:      ${ADMIN_PASS}"
+}
+
+cmd_seed() {
+    echo "==> Seeding deterministic Cacti data..."
+
+    local db_cmd=(docker exec -i "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
+
+    "${db_cmd[@]}" <<'SQL'
+SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_ZERO_DATE', '');
+SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_ZERO_IN_DATE', '');
+
+DELETE FROM graph_tree_items WHERE graph_tree_id IN (
+  SELECT id FROM graph_tree WHERE name = 'Northwind Network Operations'
+);
+DELETE FROM graph_tree WHERE name = 'Northwind Network Operations';
+DELETE FROM host WHERE external_id LIKE 'NW-%';
+DELETE FROM sites WHERE name IN ('Portland Edge DC', 'Denver Core DC', 'Remote Retail Labs');
+
+INSERT INTO sites
+  (name, disabled, address1, city, state, postal_code, country, region, timezone, latitude, longitude, alternate_id, notes, devices)
+VALUES
+  ('Portland Edge DC', '', '410 Alder Street', 'Portland', 'OR', '97204', 'USA', 'Pacific Northwest', 'America/Los_Angeles', 45.5202471000, -122.6741949000, 'PDX-EDGE', 'Seeded 2026-01-15: regional edge and checkout ingress.', 0),
+  ('Denver Core DC', '', '1800 Wazee Street', 'Denver', 'CO', '80202', 'USA', 'Mountain', 'America/Denver', 39.7531960000, -104.9960640000, 'DEN-CORE', 'Seeded 2026-01-15: core switching and billing systems.', 0),
+  ('Remote Retail Labs', '', '88 Harbor Way', 'Boise', 'ID', '83702', 'USA', 'Mountain', 'America/Boise', 43.6150186000, -116.2023137000, 'BOI-LAB', 'Seeded 2026-01-15: remote lab sensors and backup links.', 0);
+
+INSERT INTO host
+  (poller_id, site_id, host_template_id, description, hostname, location, notes, external_id,
+   snmp_community, snmp_version, snmp_port, snmp_timeout, snmp_retries,
+   availability_method, ping_method, ping_port, ping_timeout, ping_retries,
+   disabled, status, status_event_count, status_fail_date, status_rec_date,
+   status_last_error, min_time, max_time, cur_time, avg_time, total_polls,
+   failed_polls, availability, created, last_updated)
+SELECT 1, s.id, 0, v.description, v.hostname, v.location, v.notes, v.external_id,
+       v.community, v.snmp_version, 161, 500, 2,
+       2, 3, v.ping_port, 500, 2,
+       v.disabled, v.status, v.status_event_count, v.status_fail_date, v.status_rec_date,
+       v.status_last_error, v.min_time, v.max_time, v.cur_time, v.avg_time, v.total_polls,
+       v.failed_polls, v.availability, '2026-01-15 09:00:00', '2026-01-15 09:30:00'
+FROM (
+  SELECT 'Portland Edge DC' site_name, 'Portland Edge Router' description, '10.10.0.1' hostname, 'PDX rack A1' location, 'Primary customer ingress router for checkout traffic.' notes, 'NW-PDX-RTR-01' external_id, 'northwind-ro' community, 2 snmp_version, 22 ping_port, '' disabled, 3 status, 0 status_event_count, '0000-00-00 00:00:00' status_fail_date, '2026-01-15 08:10:00' status_rec_date, '' status_last_error, 0.01200 min_time, 0.08800 max_time, 0.03100 cur_time, 0.03400 avg_time, 1440 total_polls, 1 failed_polls, 99.93000 availability
+  UNION ALL SELECT 'Portland Edge DC', 'Portland Checkout API Probe', '10.10.0.22', 'PDX rack B2', 'Synthetic probe monitoring checkout API latency.', 'NW-PDX-API-22', 'northwind-ro', 2, 443, '', 2, 1, '2026-01-15 07:55:00', '2026-01-15 09:12:00', 'Recovered from TCP timeout during morning deploy.', 0.02000, 0.42000, 0.11500, 0.15100, 1440, 18, 98.75000
+  UNION ALL SELECT 'Denver Core DC', 'Denver Core Switch Stack', '10.20.0.10', 'DEN cage C', 'Stack of core switches serving billing and inventory VLANs.', 'NW-DEN-SW-10', 'northwind-ro', 2, 22, '', 3, 0, '0000-00-00 00:00:00', '2026-01-15 08:00:00', '', 0.00900, 0.05100, 0.01800, 0.02000, 1440, 0, 100.00000
+  UNION ALL SELECT 'Denver Core DC', 'Denver Billing Database', '10.20.0.45', 'DEN cage D', 'Database endpoint watched with TCP availability checks.', 'NW-DEN-DB-45', '', 0, 3306, '', 1, 3, '2026-01-15 06:40:00', '0000-00-00 00:00:00', 'TCP timeout on port 3306 after storage maintenance.', 0.03100, 1.90000, 0.00000, 0.38800, 1440, 108, 92.50000
+  UNION ALL SELECT 'Remote Retail Labs', 'Retail Lab Sensor Gateway', '10.30.5.12', 'BOI lab shelf 2', 'Disabled while firmware validation is paused.', 'NW-BOI-IOT-12', 'northwind-lab', 2, 161, 'on', 0, 0, '0000-00-00 00:00:00', '0000-00-00 00:00:00', 'Monitoring disabled for firmware validation.', 0.00000, 0.00000, 0.00000, 0.00000, 0, 0, 100.00000
+  UNION ALL SELECT 'Remote Retail Labs', 'Retail Lab Long Haul Backup Link', '10.30.9.77', 'BOI telco closet', 'Backup WAN link with SNMP authentication issue.', 'NW-BOI-WAN-77', 'northwind-lab', 2, 22, '', 4, 5, '2026-01-15 04:20:00', '0000-00-00 00:00:00', 'SNMP authentication failure on backup provider link.', 0.08000, 2.70000, 0.00000, 0.61200, 1440, 184, 87.22000
+) AS v
+JOIN sites s ON s.name = v.site_name;
+
+UPDATE sites s
+SET devices = (SELECT COUNT(*) FROM host h WHERE h.site_id = s.id AND h.deleted = '')
+WHERE s.name IN ('Portland Edge DC', 'Denver Core DC', 'Remote Retail Labs');
+
+INSERT INTO graph_tree (enabled, locked, locked_date, sort_type, name, sequence, user_id, last_modified, modified_by)
+VALUES ('on', 0, '0000-00-00 00:00:00', 1, 'Northwind Network Operations', 1, 1, '2026-01-15 09:30:00', 1);
+
+SET @tree_id := LAST_INSERT_ID();
+
+INSERT INTO graph_tree_items (parent, position, graph_tree_id, local_graph_id, title, host_id, site_id, host_grouping_type, sort_children_type)
+VALUES
+  (0, 1, @tree_id, 0, 'Portland Edge DC', 0, (SELECT id FROM sites WHERE name='Portland Edge DC'), 1, 2),
+  (0, 2, @tree_id, 0, 'Denver Core DC', 0, (SELECT id FROM sites WHERE name='Denver Core DC'), 1, 2),
+  (0, 3, @tree_id, 0, 'Remote Retail Labs', 0, (SELECT id FROM sites WHERE name='Remote Retail Labs'), 1, 2);
+
+SET @pdx_node := (SELECT id FROM graph_tree_items WHERE graph_tree_id=@tree_id AND title='Portland Edge DC');
+SET @den_node := (SELECT id FROM graph_tree_items WHERE graph_tree_id=@tree_id AND title='Denver Core DC');
+SET @boi_node := (SELECT id FROM graph_tree_items WHERE graph_tree_id=@tree_id AND title='Remote Retail Labs');
+
+INSERT INTO graph_tree_items (parent, position, graph_tree_id, local_graph_id, title, host_id, site_id, host_grouping_type, sort_children_type)
+SELECT @pdx_node, 1, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-PDX-RTR-01'
+UNION ALL SELECT @pdx_node, 2, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-PDX-API-22'
+UNION ALL SELECT @den_node, 1, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-DEN-SW-10'
+UNION ALL SELECT @den_node, 2, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-DEN-DB-45'
+UNION ALL SELECT @boi_node, 1, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-BOI-IOT-12'
+UNION ALL SELECT @boi_node, 2, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-BOI-WAN-77';
+SQL
+
+    echo "==> Seed complete: Northwind Network Operations (3 sites, 6 devices, 1 graph tree)."
+}
+
+cmd_verify() {
+    echo "==> Verifying Cacti deployment..."
+
+    # Check web server responds
+    if ! curl -sf -o /dev/null "http://localhost:${PORT}/cacti/"; then
+        echo "==> Verification FAILED: Web server not responding at http://localhost:${PORT}/cacti/"
+        return 1
+    fi
+    echo "==> Web server responds at /cacti/"
+
+    # Check login page shows Cacti
+    if ! curl -sf "http://localhost:${PORT}/cacti/index.php" | grep -q 'Cacti'; then
+        echo "==> Verification FAILED: Cacti login page not detected."
+        return 1
+    fi
+    echo "==> Login page detected."
+
+    # Check database has admin user
+    local admin_count
+    admin_count=$(docker exec "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -N -e \
+        "SELECT COUNT(*) FROM user_auth WHERE username = '${ADMIN_USER}';" 2>/dev/null)
+    if [[ "${admin_count}" != "1" ]]; then
+        echo "==> Verification FAILED: Admin user not found in database."
+        return 1
+    fi
+    echo "==> Admin user present in database."
+
+    local db_cmd=(docker exec -i "${DB_CONTAINER}" mariadb -N -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
+
+    local seed_counts
+    seed_counts=$("${db_cmd[@]}" -e "SELECT CONCAT((SELECT COUNT(*) FROM sites WHERE name IN ('Portland Edge DC','Denver Core DC','Remote Retail Labs')), ',', (SELECT COUNT(*) FROM host WHERE external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM graph_tree WHERE name='Northwind Network Operations'), ',', (SELECT COUNT(*) FROM graph_tree_items gti JOIN graph_tree gt ON gt.id=gti.graph_tree_id WHERE gt.name='Northwind Network Operations'));" 2>/dev/null)
+    if [[ "${seed_counts}" != "3,6,1,9" ]]; then
+        echo "==> Verification FAILED: Seed counts mismatch (sites,hosts,trees,tree_items=${seed_counts}; expected 3,6,1,9)."
+        return 1
+    fi
+    echo "==> Seed counts verified: 3 sites, 6 devices, 1 tree, 9 tree items."
+
+    local status_counts
+    status_counts=$("${db_cmd[@]}" -e "SELECT CONCAT(SUM(status=3), ',', SUM(status=2), ',', SUM(status=1), ',', SUM(status=4), ',', SUM(disabled='on')) FROM host WHERE external_id LIKE 'NW-%';" 2>/dev/null)
+    if [[ "${status_counts}" != "2,1,1,1,1" ]]; then
+        echo "==> Verification FAILED: Seed status mix mismatch (up,recovering,down,error,disabled=${status_counts}; expected 2,1,1,1,1)."
+        return 1
+    fi
+    echo "==> Seed status mix verified: 2 up, 1 recovering, 1 down, 1 error, 1 disabled."
+
+    local expected_names
+    expected_names="Denver Billing Database|Denver Core Switch Stack|Portland Checkout API Probe|Portland Edge Router|Retail Lab Long Haul Backup Link|Retail Lab Sensor Gateway"
+    local actual_names
+    actual_names=$("${db_cmd[@]}" -e "SELECT GROUP_CONCAT(description ORDER BY description SEPARATOR '|') FROM host WHERE external_id LIKE 'NW-%';" 2>/dev/null)
+    if [[ "${actual_names}" != "${expected_names}" ]]; then
+        echo "==> Verification FAILED: Seed device names mismatch."
+        echo "    Actual:   ${actual_names}"
+        echo "    Expected: ${expected_names}"
+        return 1
+    fi
+    echo "==> Seed device names verified."
+
+    echo "==> Verification passed."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (project: ${COMPOSE_PROJECT})..."
+    env $(compose_env) \
+        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
+        down -v 2>/dev/null || true
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping containers (project: ${COMPOSE_PROJECT})..."
+    env $(compose_env) \
+        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
+        down 2>/dev/null || true
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${WEB_CONTAINER}" 2>/dev/null || echo "No containers running."
+}
+
+cmd_status() {
+    echo "=== Cacti Status ==="
+    echo "Run ID:     ${RUN_ID}"
+    echo "Project:    ${COMPOSE_PROJECT}"
+    echo "Port:       ${PORT}"
+    echo "Source:     ${SOURCE_DIR}"
+    echo ""
+
+    local running
+    running=$(docker ps --filter "name=${WEB_CONTAINER}" --filter "name=${DB_CONTAINER}" --format "{{.Names}}" 2>/dev/null || true)
+
+    if [ -n "$running" ]; then
+        echo "Status: RUNNING"
+        echo "URL:    http://localhost:${PORT}/cacti/"
+        echo "User:   ${ADMIN_USER}"
+        echo ""
+        docker ps --filter "name=${WEB_CONTAINER}" --filter "name=${DB_CONTAINER}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Cacti - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>] [--source-dir <path>]
+
+Commands:
+  deploy       Clone source (if needed), build Docker image, start containers,
+               apply runtime fixups, run CLI installer, set admin credentials.
+  seed         Populate deterministic Northwind network sites, devices, and tree.
+  verify       Health-check web/login/admin plus deterministic seed counts.
+  reset        Stop containers, remove containers and named volumes.
+  stop         Stop containers (preserves data).
+  logs         Tail all container logs.
+  status       Show container status, URL, and credentials.
+  help         Show this help message.
+
+Options:
+  --run-id <id>     Isolate containers and volumes for parallel runs.
+                    Uses distinct docker compose project names.
+                    Default: default
+  --port <port>     Host port to bind. Container port is always 80.
+                    Default: 8089
+  --source-dir <p>  Path to Cacti source checkout.
+                    Default: ${SOURCE_DIR}
+  --help|-h         Show this help message.
+
+Credentials:
+  Admin:  ${ADMIN_USER} / ${ADMIN_PASS}
+  DB:     ${DB_USER} / ${DB_PASSWORD} (database: ${DB_NAME})
+
+Reset path:
+  ./tester-env reset && ./tester-env deploy && ./tester-env seed && ./tester-env verify
+
+Parallel runs:
+  ./tester-env deploy --run-id run-001 --port 8091
+  ./tester-env deploy --run-id run-002 --port 8092
+  ./tester-env reset --run-id run-001
+
+Caveats:
+  - PHP 8.4 deprecation warnings break the CLI installer; suppressed via php.ini.
+  - fping must be installed in the web container for path checks to pass.
+  - Cache subdirectories (boost, mibcache, realtime, spikekill) must be created.
+  - Schema auto-imports cacti.sql on first DB start (mounted as init script).
+  - Built from editable source via bind mount at /var/www/html/cacti.
+  - Browser MCP access via http://host.docker.internal:{port}/cacti/.
+  - First login may redirect to /cacti/index.php after login POST with CSRF token.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --run-id)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    RUN_ID="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --run-id requires a value"
+                    exit 1
+                fi
+                ;;
+            --port)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    PORT="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --port requires a value"
+                    exit 1
+                fi
+                ;;
+            --source-dir)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then
+                    SOURCE_DIR="${!next}"
+                    ((i++))
+                else
+                    echo "Error: --source-dir requires a value"
+                    exit 1
+                fi
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: ${arg}"
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
