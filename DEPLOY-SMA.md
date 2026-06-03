@@ -30,13 +30,13 @@ Full reset-deploy-seed-verify cycle:
 
 ## Build Method
 
-- **Method:** `docker compose up --build` using upstream `docker-compose.yml`
+- **Method:** `docker compose up --build` using `docker-compose.tester-env.yml`
 - **Source:** Mounted as bind volume into web container at `/var/www/html/cacti`
 - **Web image:** `php:8.4-fpm-bookworm` (built locally with Apache + PHP-FPM)
 - **DB image:** `mariadb:11.8`
-- **Services:** web (port 8089), db (port 3306)
-- **Volumes:** cacti_db, cacti_cache, cacti_rra, cacti_logs
-- **Project name:** `tester-env-cacti`
+- **Services:** web (host port 8089 by default), db (internal only)
+- **Volumes:** cacti_db, cacti_cache, cacti_rra, cacti_logs scoped by Compose project
+- **Project name:** `tester-env-cacti` or `tester-env-cacti-<run-id>`
 
 ## Runtime Fixups
 
@@ -48,9 +48,9 @@ Full reset-deploy-seed-verify cycle:
 
 ## Caveats
 
-- Upstream `docker-compose.yml` hardcodes `container_name: cacti_web / cacti_db`, preventing parallel `--run-id` isolation without editing compose file
+- Upstream `docker-compose.yml` hardcodes `container_name: cacti_web / cacti_db`; tester-env uses `docker-compose.tester-env.yml` without fixed container names so `--run-id` isolates parallel runs
 - CLI installer runs as root via `docker exec`, creating log files owned by root; without post-install `chown`, php-fpm (www-data) cannot write `cacti.log`, causing "System log file is not available for writing" FATAL and session recursion
-- Only single-run deploys with default container names are supported currently
+- MariaDB is not published to the host in tester-env; maintenance commands run through `docker compose exec db`
 
 ## Credentials
 

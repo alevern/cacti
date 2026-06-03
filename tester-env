@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Build context is the submodule itself; the tester-env CLI is committed
 # into the fork alongside the source it builds.
 SOURCE_DIR="${SOURCE_DIR:-${SCRIPT_DIR}}"
+COMPOSE_FILE="docker-compose.tester-env.yml"
 
 # Cacti-specific settings
 DB_ROOT_PASSWORD="root"
@@ -28,15 +29,20 @@ refresh_names() {
     COMPOSE_PROJECT="tester-env-cacti"
     if [[ "${RUN_ID}" != "default" ]]; then
         COMPOSE_PROJECT="${COMPOSE_PROJECT}-${RUN_ID}"
-        # Upstream docker-compose.yml hardcodes container_name: cacti_web / cacti_db.
-        # Parallel runs with --run-id need the compose file edited to use unique names,
-        # or a separate source tree. For single-run deploys, use the fixed names.
-        WEB_CONTAINER="cacti_web-${RUN_ID}"
-        DB_CONTAINER="cacti_db-${RUN_ID}"
-    else
-        WEB_CONTAINER="cacti_web"
-        DB_CONTAINER="cacti_db"
     fi
+}
+
+compose_cmd() {
+    env $(compose_env) \
+        docker compose -f "${SOURCE_DIR}/${COMPOSE_FILE}" -p "${COMPOSE_PROJECT}" "$@"
+}
+
+compose_exec() {
+    compose_cmd exec -T "$@"
+}
+
+container_id() {
+    compose_cmd ps -q "$1"
 }
 
 compose_env() {
@@ -51,7 +57,7 @@ compose_env() {
 }
 
 clone_source() {
-    if [[ ! -d "${SOURCE_DIR}/.git" ]]; then
+    if [[ ! -d "${SOURCE_DIR}/.git" ]] && [[ ! -f "${SOURCE_DIR}/.git" ]]; then
         echo "ERROR: SOURCE_DIR=${SOURCE_DIR} is not a git checkout. The CLI" >&2
         echo "expects to run from inside the Cacti fork submodule." >&2
         exit 1
@@ -66,7 +72,7 @@ post_deploy_fixups() {
     # Create php.ini to suppress PHP 8.4 deprecation warnings that break the CLI installer
     # (Deprecated: Constant E_STRICT and nullable parameter warnings pollute stdout,
     #  causing json_decode in utility_php_extensions to fail)
-    docker exec "${WEB_CONTAINER}" bash -c 'cat > /usr/local/etc/php/php.ini <<EOF
+    compose_exec web bash -c 'cat > /usr/local/etc/php/php.ini <<EOF
 memory_limit = 512M
 date.timezone = UTC
 max_execution_time = 60
@@ -76,11 +82,11 @@ EOF
 '
 
     # Install fping (required by Cacti for device availability checks)
-    docker exec "${WEB_CONTAINER}" apt-get update -qq 2>/dev/null
-    docker exec "${WEB_CONTAINER}" apt-get install -y -qq fping 2>/dev/null || true
+    compose_exec web apt-get update -qq 2>/dev/null
+    compose_exec web apt-get install -y -qq fping 2>/dev/null || true
 
     # Create cache subdirectories (not created by Dockerfile, needed for install)
-    docker exec "${WEB_CONTAINER}" bash -c '
+    compose_exec web bash -c '
         mkdir -p /var/www/html/cacti/cache/{boost,mibcache,realtime,spikekill}
         chown -R www-data:www-data /var/www/html/cacti/cache/
     '
@@ -88,7 +94,7 @@ EOF
 
 run_installer() {
     echo "==> Running Cacti CLI installer..."
-    docker exec "${WEB_CONTAINER}" php /var/www/html/cacti/cli/install_cacti.php \
+    compose_exec web php /var/www/html/cacti/cli/install_cacti.php \
         --install --accept-eula 2>&1 | grep -v 'Deprecated' || {
         echo "ERROR: Cacti CLI installer failed."
         return 1
@@ -98,11 +104,11 @@ run_installer() {
     # Set admin password and disable forced password change
     local passhash
     passhash=$(echo -n "${ADMIN_PASS}" | md5sum | awk '{print $1}')
-    docker exec "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -e \
+    compose_exec db mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -e \
         "UPDATE user_auth SET password = '${passhash}', must_change_password = '', password_change = 'on' WHERE username = '${ADMIN_USER}';" 2>/dev/null
 
     echo "==> Fixing file ownership (installer runs as root, web runs as www-data)..."
-    docker exec "${WEB_CONTAINER}" chown -R www-data:www-data \
+    compose_exec web chown -R www-data:www-data \
         /var/www/html/cacti/log/ \
         /var/www/html/cacti/cache/ \
         /var/www/html/cacti/rra/
@@ -121,16 +127,16 @@ cmd_deploy() {
     fi
 
     echo "==> Building and starting containers..."
-    env $(compose_env) \
-        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
-        up -d --build 2>&1 | tail -5
+    compose_cmd up -d --build 2>&1 | tail -5
 
     echo "==> Waiting for database to be healthy..."
     local max_attempts=60
     local attempt=1
     while [ $attempt -le $max_attempts ]; do
         local db_status
-        db_status=$(docker inspect "${DB_CONTAINER}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
+        local db_container
+        db_container=$(container_id db)
+        db_status=$(docker inspect "${db_container}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
         if [[ "$db_status" == "healthy" ]]; then
             echo "==> Database is healthy."
             break
@@ -143,7 +149,9 @@ cmd_deploy() {
     attempt=1
     while [ $attempt -le $max_attempts ]; do
         local web_status
-        web_status=$(docker inspect "${WEB_CONTAINER}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
+        local web_container
+        web_container=$(container_id web)
+        web_status=$(docker inspect "${web_container}" --format '{{.State.Health.Status}}' 2>/dev/null || echo "starting")
         if [[ "$web_status" == "healthy" ]]; then
             echo "==> Web container is healthy."
             break
@@ -165,7 +173,7 @@ cmd_deploy() {
 cmd_seed() {
     echo "==> Seeding deterministic Cacti data..."
 
-    local db_cmd=(docker exec -i "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
+    local db_cmd=(compose_exec db mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
 
     "${db_cmd[@]}" <<'SQL'
 SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_ZERO_DATE', '');
@@ -175,8 +183,23 @@ DELETE FROM graph_tree_items WHERE graph_tree_id IN (
   SELECT id FROM graph_tree WHERE name = 'Northwind Network Operations'
 );
 DELETE FROM graph_tree WHERE name = 'Northwind Network Operations';
+DELETE gtg FROM graph_templates_graph gtg
+JOIN graph_local gl ON gl.id = gtg.local_graph_id
+JOIN host h ON h.id = gl.host_id
+WHERE h.external_id LIKE 'NW-%';
+DELETE gl FROM graph_local gl
+JOIN host h ON h.id = gl.host_id
+WHERE h.external_id LIKE 'NW-%';
 DELETE FROM host WHERE external_id LIKE 'NW-%';
+DELETE FROM host_template WHERE name = 'Northwind Generic Device';
 DELETE FROM sites WHERE name IN ('Portland Edge DC', 'Denver Core DC', 'Remote Retail Labs');
+
+INSERT INTO host_template
+  (hash, name, version, class, tags, author, email, homepage, copyright, installation, devices)
+VALUES
+  ('nw000000000000000000000000000001', 'Northwind Generic Device', '2026.01', 'network', 'northwind,seed', 'Tester Env', 'ops@example.invalid', 'https://example.invalid/northwind', 'Northwind Traders', 'Seeded 2026-01-15: generic SNMP/TCP device profile for network operations.', 0);
+
+SET @host_template_id := LAST_INSERT_ID();
 
 INSERT INTO sites
   (name, disabled, address1, city, state, postal_code, country, region, timezone, latitude, longitude, alternate_id, notes, devices)
@@ -208,6 +231,44 @@ FROM (
 ) AS v
 JOIN sites s ON s.name = v.site_name;
 
+UPDATE host
+SET host_template_id = @host_template_id
+WHERE external_id IN ('NW-PDX-RTR-01', 'NW-PDX-API-22', 'NW-DEN-SW-10', 'NW-DEN-DB-45', 'NW-BOI-IOT-12', 'NW-BOI-WAN-77');
+
+UPDATE host_template
+SET devices = (SELECT COUNT(*) FROM host WHERE host_template_id = @host_template_id AND deleted = '')
+WHERE id = @host_template_id;
+
+INSERT INTO graph_local (graph_template_id, host_id, snmp_query_id, snmp_query_graph_id, snmp_index)
+SELECT 0, h.id, 0, 0, ''
+FROM host h
+WHERE h.external_id LIKE 'NW-%'
+ORDER BY h.external_id;
+
+INSERT INTO graph_templates_graph
+  (local_graph_id, graph_template_id, image_format_id, title, title_cache, height, width,
+   upper_limit, lower_limit, vertical_label, slope_mode, auto_scale, auto_scale_opts, auto_scale_log,
+   scale_log_units, auto_scale_rigid, auto_padding, base_value, `grouping`, unit_exponent_value,
+   alt_y_grid, no_gridfit, dynamic_labels, force_rules_legend, legend_position, legend_direction)
+SELECT gl.id, 0, 1, v.title, v.title, 120, 500,
+       '100', '0', v.label, 'on', 'on', 2, '',
+       '', '', 'on', 1000, 'on', '',
+       '', '', '', '', 'bottom', 'topdown'
+FROM graph_local gl
+JOIN host h ON h.id = gl.host_id
+JOIN (
+  SELECT 'NW-PDX-RTR-01' external_id, 'Northwind Portland Edge Router Traffic' title, 'bits/sec' label
+  UNION ALL SELECT 'NW-PDX-API-22', 'Northwind Portland Checkout API Latency', 'milliseconds'
+  UNION ALL SELECT 'NW-DEN-SW-10', 'Northwind Denver Core Switch Stack Traffic', 'bits/sec'
+  UNION ALL SELECT 'NW-DEN-DB-45', 'Northwind Denver Billing Database Connections', 'connections'
+  UNION ALL SELECT 'NW-BOI-IOT-12', 'Northwind Retail Lab Sensor Gateway Packets', 'packets/sec'
+  UNION ALL SELECT 'NW-BOI-WAN-77', 'Northwind Retail Lab Long Haul Backup Link Loss', 'percent'
+) AS v ON v.external_id = h.external_id;
+
+UPDATE host h
+SET graphs = (SELECT COUNT(*) FROM graph_local gl WHERE gl.host_id = h.id)
+WHERE h.external_id LIKE 'NW-%';
+
 UPDATE sites s
 SET devices = (SELECT COUNT(*) FROM host h WHERE h.site_id = s.id AND h.deleted = '')
 WHERE s.name IN ('Portland Edge DC', 'Denver Core DC', 'Remote Retail Labs');
@@ -234,9 +295,17 @@ UNION ALL SELECT @den_node, 1, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE ex
 UNION ALL SELECT @den_node, 2, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-DEN-DB-45'
 UNION ALL SELECT @boi_node, 1, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-BOI-IOT-12'
 UNION ALL SELECT @boi_node, 2, @tree_id, 0, NULL, id, 0, 1, 0 FROM host WHERE external_id='NW-BOI-WAN-77';
+
+INSERT INTO graph_tree_items (parent, position, graph_tree_id, local_graph_id, title, host_id, site_id, host_grouping_type, sort_children_type)
+SELECT hti.id, 1, @tree_id, gl.id, NULL, 0, 0, 1, 0
+FROM graph_tree_items hti
+JOIN host h ON h.id = hti.host_id
+JOIN graph_local gl ON gl.host_id = h.id
+WHERE hti.graph_tree_id = @tree_id
+AND h.external_id LIKE 'NW-%';
 SQL
 
-    echo "==> Seed complete: Northwind Network Operations (3 sites, 6 devices, 1 graph tree)."
+    echo "==> Seed complete: Northwind Network Operations (3 sites, 6 devices, 1 device template, 6 graphs, 1 graph tree)."
 }
 
 cmd_verify() {
@@ -249,8 +318,11 @@ cmd_verify() {
     fi
     echo "==> Web server responds at /cacti/"
 
-    # Check login page shows Cacti
-    if ! curl -sf "http://localhost:${PORT}/cacti/index.php" | grep -q 'Cacti'; then
+    # Check login page shows Cacti. Avoid `grep -q` in a pipe under pipefail:
+    # early grep exit can make curl fail with SIGPIPE after a successful match.
+    local login_body
+    login_body=$(curl -sf "http://localhost:${PORT}/cacti/index.php")
+    if [[ "${login_body}" != *Cacti* ]]; then
         echo "==> Verification FAILED: Cacti login page not detected."
         return 1
     fi
@@ -258,7 +330,7 @@ cmd_verify() {
 
     # Check database has admin user
     local admin_count
-    admin_count=$(docker exec "${DB_CONTAINER}" mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -N -e \
+    admin_count=$(compose_exec db mariadb -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" -N -e \
         "SELECT COUNT(*) FROM user_auth WHERE username = '${ADMIN_USER}';" 2>/dev/null)
     if [[ "${admin_count}" != "1" ]]; then
         echo "==> Verification FAILED: Admin user not found in database."
@@ -266,15 +338,15 @@ cmd_verify() {
     fi
     echo "==> Admin user present in database."
 
-    local db_cmd=(docker exec -i "${DB_CONTAINER}" mariadb -N -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
+    local db_cmd=(compose_exec db mariadb -N -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
 
     local seed_counts
-    seed_counts=$("${db_cmd[@]}" -e "SELECT CONCAT((SELECT COUNT(*) FROM sites WHERE name IN ('Portland Edge DC','Denver Core DC','Remote Retail Labs')), ',', (SELECT COUNT(*) FROM host WHERE external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM graph_tree WHERE name='Northwind Network Operations'), ',', (SELECT COUNT(*) FROM graph_tree_items gti JOIN graph_tree gt ON gt.id=gti.graph_tree_id WHERE gt.name='Northwind Network Operations'));" 2>/dev/null)
-    if [[ "${seed_counts}" != "3,6,1,9" ]]; then
-        echo "==> Verification FAILED: Seed counts mismatch (sites,hosts,trees,tree_items=${seed_counts}; expected 3,6,1,9)."
+    seed_counts=$("${db_cmd[@]}" -e "SELECT CONCAT((SELECT COUNT(*) FROM sites WHERE name IN ('Portland Edge DC','Denver Core DC','Remote Retail Labs')), ',', (SELECT COUNT(*) FROM host WHERE external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM host_template WHERE name='Northwind Generic Device'), ',', (SELECT COUNT(*) FROM graph_local gl JOIN host h ON h.id=gl.host_id WHERE h.external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM graph_tree WHERE name='Northwind Network Operations'), ',', (SELECT COUNT(*) FROM graph_tree_items gti JOIN graph_tree gt ON gt.id=gti.graph_tree_id WHERE gt.name='Northwind Network Operations'));" 2>/dev/null)
+    if [[ "${seed_counts}" != "3,6,1,6,1,15" ]]; then
+        echo "==> Verification FAILED: Seed counts mismatch (sites,hosts,templates,graphs,trees,tree_items=${seed_counts}; expected 3,6,1,6,1,15)."
         return 1
     fi
-    echo "==> Seed counts verified: 3 sites, 6 devices, 1 tree, 9 tree items."
+    echo "==> Seed counts verified: 3 sites, 6 devices, 1 device template, 6 graphs, 1 tree, 15 tree items."
 
     local status_counts
     status_counts=$("${db_cmd[@]}" -e "SELECT CONCAT(SUM(status=3), ',', SUM(status=2), ',', SUM(status=1), ',', SUM(status=4), ',', SUM(disabled='on')) FROM host WHERE external_id LIKE 'NW-%';" 2>/dev/null)
@@ -296,27 +368,51 @@ cmd_verify() {
     fi
     echo "==> Seed device names verified."
 
+    local template_devices
+    template_devices=$("${db_cmd[@]}" -e "SELECT CONCAT(name, '|', devices) FROM host_template WHERE name='Northwind Generic Device';" 2>/dev/null)
+    if [[ "${template_devices}" != "Northwind Generic Device|6" ]]; then
+        echo "==> Verification FAILED: Device template devices mismatch (${template_devices}; expected Northwind Generic Device|6)."
+        return 1
+    fi
+    echo "==> Seed device template verified: Northwind Generic Device with 6 devices using it."
+
+    local expected_graphs
+    expected_graphs="Northwind Denver Billing Database Connections|Northwind Denver Core Switch Stack Traffic|Northwind Portland Checkout API Latency|Northwind Portland Edge Router Traffic|Northwind Retail Lab Long Haul Backup Link Loss|Northwind Retail Lab Sensor Gateway Packets"
+    local actual_graphs
+    actual_graphs=$("${db_cmd[@]}" -e "SELECT GROUP_CONCAT(gtg.title_cache ORDER BY gtg.title_cache SEPARATOR '|') FROM graph_templates_graph gtg JOIN graph_local gl ON gl.id=gtg.local_graph_id JOIN host h ON h.id=gl.host_id WHERE h.external_id LIKE 'NW-%';" 2>/dev/null)
+    if [[ "${actual_graphs}" != "${expected_graphs}" ]]; then
+        echo "==> Verification FAILED: Seed graph names mismatch."
+        echo "    Actual:   ${actual_graphs}"
+        echo "    Expected: ${expected_graphs}"
+        return 1
+    fi
+    echo "==> Seed graph names verified."
+
+    local tree_graph_items
+    tree_graph_items=$("${db_cmd[@]}" -e "SELECT COUNT(*) FROM graph_tree_items gti JOIN graph_tree gt ON gt.id=gti.graph_tree_id WHERE gt.name='Northwind Network Operations' AND gti.local_graph_id > 0;" 2>/dev/null)
+    if [[ "${tree_graph_items}" != "6" ]]; then
+        echo "==> Verification FAILED: Tree graph association count mismatch (${tree_graph_items}; expected 6)."
+        return 1
+    fi
+    echo "==> Seed graph-tree associations verified: 6 graph items under Northwind tree."
+
     echo "==> Verification passed."
 }
 
 cmd_reset() {
     echo "==> Resetting environment (project: ${COMPOSE_PROJECT})..."
-    env $(compose_env) \
-        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
-        down -v 2>/dev/null || true
+    compose_cmd down -v 2>/dev/null || true
     echo "==> Reset complete. Run 'deploy' to start fresh."
 }
 
 cmd_stop() {
     echo "==> Stopping containers (project: ${COMPOSE_PROJECT})..."
-    env $(compose_env) \
-        docker compose -f "${SOURCE_DIR}/docker-compose.yml" -p "${COMPOSE_PROJECT}" \
-        down 2>/dev/null || true
+    compose_cmd down 2>/dev/null || true
     echo "==> Stopped."
 }
 
 cmd_logs() {
-    docker logs -f "${WEB_CONTAINER}" 2>/dev/null || echo "No containers running."
+    compose_cmd logs -f web 2>/dev/null || echo "No containers running."
 }
 
 cmd_status() {
@@ -328,14 +424,14 @@ cmd_status() {
     echo ""
 
     local running
-    running=$(docker ps --filter "name=${WEB_CONTAINER}" --filter "name=${DB_CONTAINER}" --format "{{.Names}}" 2>/dev/null || true)
+    running=$(compose_cmd ps --services --status running 2>/dev/null || true)
 
     if [ -n "$running" ]; then
         echo "Status: RUNNING"
         echo "URL:    http://localhost:${PORT}/cacti/"
         echo "User:   ${ADMIN_USER}"
         echo ""
-        docker ps --filter "name=${WEB_CONTAINER}" --filter "name=${DB_CONTAINER}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null
+        compose_cmd ps
     else
         echo "Status: NOT RUNNING"
     fi
