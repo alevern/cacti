@@ -303,9 +303,24 @@ JOIN host h ON h.id = hti.host_id
 JOIN graph_local gl ON gl.host_id = h.id
 WHERE hti.graph_tree_id = @tree_id
 AND h.external_id LIKE 'NW-%';
+
+DELETE ugm FROM user_auth_group_members ugm
+JOIN user_auth_group uag ON uag.id = ugm.group_id
+WHERE uag.name = 'Administrators';
+DELETE FROM user_auth_group WHERE name = 'Administrators';
+
+INSERT INTO user_auth_group
+  (name, description, enabled)
+VALUES
+  ('Administrators', 'Administrators', 'on');
+
+SET @admin_group_id := LAST_INSERT_ID();
+
+INSERT INTO user_auth_group_members (group_id, user_id)
+SELECT @admin_group_id, id FROM user_auth WHERE username = 'admin';
 SQL
 
-    echo "==> Seed complete: Northwind Network Operations (3 sites, 6 devices, 1 device template, 6 graphs, 1 graph tree)."
+    echo "==> Seed complete: Northwind Network Operations (3 sites, 6 devices, 1 device template, 6 graphs, 1 graph tree, Administrators group with admin member)."
 }
 
 cmd_verify() {
@@ -339,6 +354,30 @@ cmd_verify() {
     echo "==> Admin user present in database."
 
     local db_cmd=(compose_exec db mariadb -N -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}")
+
+    local admin_group
+    admin_group=$("${db_cmd[@]}" -e "SELECT CONCAT(name, '|', enabled) FROM user_auth_group WHERE name='Administrators';" 2>/dev/null)
+    if [[ "${admin_group}" != "Administrators|on" ]]; then
+        echo "==> Verification FAILED: Administrators group missing or disabled (${admin_group}; expected Administrators|on)."
+        return 1
+    fi
+    echo "==> Administrators group present and enabled."
+
+    local admin_membership
+    admin_membership=$("${db_cmd[@]}" -e "SELECT COUNT(*) FROM user_auth_group_members ugm JOIN user_auth_group uag ON uag.id=ugm.group_id JOIN user_auth ua ON ua.id=ugm.user_id WHERE uag.name='Administrators' AND ua.username='${ADMIN_USER}';" 2>/dev/null)
+    if [[ "${admin_membership}" != "1" ]]; then
+        echo "==> Verification FAILED: Admin user is not a member of the Administrators group (${admin_membership}; expected 1)."
+        return 1
+    fi
+    echo "==> Admin membership in Administrators group verified."
+
+    local viewer_grouped
+    viewer_grouped=$("${db_cmd[@]}" -e "SELECT COUNT(*) FROM user_auth_group_members ugm JOIN user_auth_group uag ON uag.id=ugm.group_id JOIN user_auth ua ON ua.id=ugm.user_id WHERE uag.name='Administrators' AND ua.username='northwind-viewer';" 2>/dev/null)
+    if [[ "${viewer_grouped}" != "0" ]]; then
+        echo "==> Verification FAILED: Comparison user northwind-viewer must not belong to the Administrators group (${viewer_grouped}; expected 0)."
+        return 1
+    fi
+    echo "==> Comparison exclusion verified: northwind-viewer is not in the Administrators group."
 
     local seed_counts
     seed_counts=$("${db_cmd[@]}" -e "SELECT CONCAT((SELECT COUNT(*) FROM sites WHERE name IN ('Portland Edge DC','Denver Core DC','Remote Retail Labs')), ',', (SELECT COUNT(*) FROM host WHERE external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM host_template WHERE name='Northwind Generic Device'), ',', (SELECT COUNT(*) FROM graph_local gl JOIN host h ON h.id=gl.host_id WHERE h.external_id LIKE 'NW-%'), ',', (SELECT COUNT(*) FROM graph_tree WHERE name='Northwind Network Operations'), ',', (SELECT COUNT(*) FROM graph_tree_items gti JOIN graph_tree gt ON gt.id=gti.graph_tree_id WHERE gt.name='Northwind Network Operations'));" 2>/dev/null)

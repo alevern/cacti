@@ -88,6 +88,13 @@ Full reset-deploy-seed-verify cycle:
 
 **Graph Tree:** Northwind Network Operations (1 tree, 9 tree items: 3 site headers + 6 device leaves)
 
+## Group Seed — Administrators Membership (cacti-user-admin-group-filter-001)
+
+- Prerequisite: none beyond a deployed database holding the default `admin` user; the seed resolves the admin id by username at seed time.
+- `./tester-env seed` also ensures one genuine enabled `Administrators` group (`user_auth_group` row with `name`/`description` `Administrators`, `enabled='on'`) and exactly one membership row binding it to `admin` (`user_auth_group_members`). Idempotent by natural key `name` (delete-then-insert, no duplicate memberships); no other users, groups, or permissions are touched. `northwind-viewer` remains scenario-created via the ordinary UI step.
+- `./tester-env verify` exits nonzero unless the group is present/enabled, `admin` is its member, and `northwind-viewer` (if present) is excluded from it.
+- Qualification pending: central reset/reseed/verify plus browser UI group-filter qualification on fixed subnet `10.180.184.0/24` still required; no live proof was produced with this static-only change.
+
 ## Determinism
 
 - Two full reset+deploy+seed+verify cycles passed with identical counts
