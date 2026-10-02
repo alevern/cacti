@@ -59,3 +59,10 @@ volumes:
   cacti_cache:
   cacti_rra:
   cacti_logs:
+
+# Explicit subnet for serial tester runs, avoiding exhausted default pools.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${CACTI_SUBNET:-10.180.184.0/24}

@@ -36,6 +36,7 @@ Full reset-deploy-seed-verify cycle:
 - **DB image:** `mariadb:11.8`
 - **Services:** web (host port 8089 by default), db (internal only)
 - **Volumes:** cacti_db, cacti_cache, cacti_rra, cacti_logs scoped by Compose project
+- **Network:** compose `default` uses `${CACTI_SUBNET:-10.180.184.0/24}`. Tester runs use this explicit subnet serially to avoid exhausted default pools; central scenario metadata declares `supports_parallel_runs=false`.
 - **Project name:** `tester-env-cacti` or `tester-env-cacti-<run-id>`
 
 ## Runtime Fixups
